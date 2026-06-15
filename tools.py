@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -20,6 +21,15 @@ from groq import Groq
 from utils.data_loader import load_listings
 
 load_dotenv()
+
+# Groq model used by the two LLM-backed tools (suggest_outfit, create_fit_card).
+MODEL = "llama-3.3-70b-versatile"
+
+# Tiny stop-word list so common filler words don't inflate relevance scores.
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "for", "with", "in", "of", "to", "my",
+    "some", "looking", "want", "need", "size", "under", "im", "i", "me",
+}
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -69,8 +79,60 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # 1. Apply the hard filters (size + price) before scoring relevance.
+    filtered = []
+    for item in listings:
+        if max_price is not None and item["price"] > max_price:
+            continue
+        if size is not None and size.strip():
+            # Case-insensitive substring match so "M" matches "S/M",
+            # "M (oversized)", etc.
+            if size.strip().lower() not in item["size"].lower():
+                continue
+        filtered.append(item)
+
+    # 2. Tokenize the description into meaningful keywords.
+    tokens = [
+        t for t in re.findall(r"[a-z0-9]+", description.lower())
+        if len(t) > 1 and t not in _STOPWORDS
+    ]
+
+    # No usable keywords (e.g. description was just stop-words): the size/price
+    # filters are all we have, so return everything that passed them.
+    if not tokens:
+        return filtered
+
+    # 3. Score each listing by weighted keyword overlap. Matches in the title
+    #    or style_tags count for more than matches buried in the description.
+    scored = []
+    for item in filtered:
+        strong = " ".join([
+            item["title"],
+            " ".join(item.get("style_tags", [])),
+            item["category"],
+        ]).lower()
+        weak = " ".join([
+            item["description"],
+            " ".join(item.get("colors", [])),
+            item.get("brand") or "",
+        ]).lower()
+
+        score = 0
+        for token in tokens:
+            if token in strong:
+                score += 2
+            elif token in weak:
+                score += 1
+
+        # 4. Drop anything with no keyword overlap at all.
+        if score > 0:
+            scored.append((score, item))
+
+    # 5. Sort by score, highest first (stable sort keeps dataset order for ties).
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _score, item in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +162,66 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    item_line = (
+        f"{new_item.get('title', 'this item')} "
+        f"(category: {new_item.get('category', 'unknown')}, "
+        f"colors: {', '.join(new_item.get('colors', [])) or 'unspecified'}, "
+        f"style: {', '.join(new_item.get('style_tags', [])) or 'unspecified'})"
+    )
+
+    items = wardrobe.get("items", []) if isinstance(wardrobe, dict) else []
+
+    if not items:
+        # Empty wardrobe → general styling advice, no invented owned pieces.
+        prompt = (
+            f"A shopper is considering this secondhand piece: {item_line}.\n"
+            "They haven't told us what's in their closet yet. In 2-3 sentences, "
+            "give general styling advice: what kinds of pieces pair well with it, "
+            "what vibe it suits, and one concrete tip for wearing it. "
+            "Do NOT invent specific items they own — speak in general terms."
+        )
+    else:
+        # Non-empty wardrobe → outfits using their actual named pieces.
+        closet = "\n".join(
+            f"- {w.get('name', 'item')} ({w.get('category', '?')})"
+            for w in items
+        )
+        prompt = (
+            f"A shopper is considering this secondhand piece: {item_line}.\n\n"
+            f"Here is what's already in their wardrobe:\n{closet}\n\n"
+            "Suggest 1-2 complete outfits that pair the new piece with specific "
+            "items from their wardrobe. Refer to the wardrobe pieces by name. "
+            "Keep it to 2-4 sentences and add one concrete styling tip "
+            "(tuck, roll, layer, cuff, etc.)."
+        )
+
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a sharp, encouraging secondhand-fashion stylist.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7,
+            max_tokens=300,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        if text:
+            return text
+        # Empty model output — fall through to the fallback below.
+        raise ValueError("empty LLM response")
+    except Exception:
+        # Never return "" or raise to the caller: give a usable fallback so the
+        # planning loop can still proceed to create_fit_card.
+        return (
+            f"Style {new_item.get('title', 'this piece')} with simple, "
+            "complementary basics — neutral bottoms and clean footwear let it "
+            "stand out. Keep the rest of the look minimal so the piece is the focus."
+        )
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +253,52 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # 1. Guard against an empty or whitespace-only outfit string.
+    if not outfit or not outfit.strip():
+        return (
+            "Can't generate a fit card without an outfit suggestion — "
+            "try a different query so I have a look to caption."
+        )
+
+    title = new_item.get("title", "this piece")
+    price = new_item.get("price")
+    platform = new_item.get("platform", "a resale app")
+    price_str = f"${price:g}" if isinstance(price, (int, float)) else "a steal"
+
+    prompt = (
+        f"Write a short, casual Instagram/TikTok caption for a thrifted find.\n"
+        f"Item: {title}\n"
+        f"Price: {price_str}\n"
+        f"Platform: {platform}\n"
+        f"Outfit: {outfit}\n\n"
+        "Rules: 2-4 sentences. Sound like a real person posting their fit, "
+        "NOT a product description. Mention the item name, the price, and the "
+        "platform naturally, once each. Capture the outfit vibe in specific "
+        "terms. A tasteful emoji or two is fine."
+    )
+
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You write punchy, authentic secondhand-fashion captions.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            # High temperature so repeated calls on the same input read differently.
+            temperature=1.0,
+            max_tokens=150,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        if text:
+            return text
+        raise ValueError("empty LLM response")
+    except Exception:
+        # Fallback template so the user always gets a caption.
+        return (
+            f"just thrifted this {title} for {price_str} on {platform} 🛍️ "
+            f"styled it exactly how I pictured — obsessed."
+        )
